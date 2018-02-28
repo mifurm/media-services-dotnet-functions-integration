@@ -1,5 +1,5 @@
 /*
-This function adds a text file to an existing asset.
+This function adds a text file to an existing asset. Oct 17 version.
 As a option, the text can be converted from ttml to vtt (useful when the ttml has been translated with MS Translator and the user wants a VTT file for Azure Media Player
 
 Input:
@@ -40,21 +40,24 @@ using Microsoft.WindowsAzure.Storage.Blob;
 using Microsoft.WindowsAzure.Storage.Auth;
 using Microsoft.Azure.WebJobs;
 using System.Xml.Linq;
-
+using Microsoft.IdentityModel.Clients.ActiveDirectory;
 
 // Read values from the App.config file.
-private static readonly string _mediaServicesAccountName = Environment.GetEnvironmentVariable("AMSAccount");
-private static readonly string _mediaServicesAccountKey = Environment.GetEnvironmentVariable("AMSKey");
-
 static string _storageAccountName = Environment.GetEnvironmentVariable("MediaServicesStorageAccountName");
 static string _storageAccountKey = Environment.GetEnvironmentVariable("MediaServicesStorageAccountKey");
 
+static readonly string _AADTenantDomain = Environment.GetEnvironmentVariable("AMSAADTenantDomain");
+static readonly string _RESTAPIEndpoint = Environment.GetEnvironmentVariable("AMSRESTAPIEndpoint");
+
+static readonly string _mediaservicesClientId = Environment.GetEnvironmentVariable("AMSClientId");
+static readonly string _mediaservicesClientSecret = Environment.GetEnvironmentVariable("AMSClientSecret");
+
 // Field for service context.
 private static CloudMediaContext _context = null;
-private static MediaServicesCredentials _cachedCredentials = null;
 private static CloudStorageAccount _destinationStorageAccount = null;
 
-public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
+
+public static async Task<object> Run(HttpRequestMessage req, TraceWriter log, Microsoft.Azure.WebJobs.ExecutionContext execContext)
 {
     log.Info($"Webhook was triggered!");
 
@@ -99,20 +102,20 @@ public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
         });
     }
 
-    log.Info($"Using Azure Media Services account : {_mediaServicesAccountName}");
+    log.Info($"Using Azure Media Service Rest API Endpoint : {_RESTAPIEndpoint}");
 
     try
     {
         string document = (string)data.document;
         string fileName = (string)data.fileName;
 
-        // Create and cache the Media Services credentials in a static class variable.
-        _cachedCredentials = new MediaServicesCredentials(
-                        _mediaServicesAccountName,
-                        _mediaServicesAccountKey);
+        AzureAdTokenCredentials tokenCredentials = new AzureAdTokenCredentials(_AADTenantDomain,
+                              new AzureAdClientSymmetricKey(_mediaservicesClientId, _mediaservicesClientSecret),
+                              AzureEnvironments.AzureCloudEnvironment);
 
-        // Used the chached credentials to create CloudMediaContext.
-        _context = new CloudMediaContext(_cachedCredentials);
+        AzureAdTokenProvider tokenProvider = new AzureAdTokenProvider(tokenCredentials);
+
+        _context = new CloudMediaContext(new Uri(_RESTAPIEndpoint), tokenProvider);
 
         // Get the asset
         string assetid = data.assetId;

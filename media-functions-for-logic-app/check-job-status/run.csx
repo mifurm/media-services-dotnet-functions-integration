@@ -1,10 +1,11 @@
 /*
-This function check a job status.
+This function checks a job status.
 
 Input:
 {
     "jobId" : "nb:jid:UUID:1ceaa82f-2607-4df9-b034-cd730dad7097", // Mandatory, Id of the source asset
-    "extendedInfo" : true // optional. Returns ams account unit size, nb units, nb of jobs in queue, scheduled and running states. Only if job is complete or error
+    "extendedInfo" : true, // optional. Returns ams account unit size, nb units, nb of jobs in queue, scheduled and running states. Only if job is complete or error
+    "noWait" : true // optional. Set this parameter if you don't want the function to wait. Otherwise it waits for 15 seconds if the job is not completed before doing another check and terminate
  }
 
 Output:
@@ -15,7 +16,8 @@ Output:
     "errorText" : ""            // error(s) text if job state is error
     "startTime" :""
     "endTime" : "",
-    "runningDuration" : ""
+    "runningDuration" : "",
+    "progress" : 20.3           // overall progress, between 0 and 100
     "extendedInfo" :            // if extendedInfo is true and job is finished or in error
     {
         "mediaUnitNumber" = 2,
@@ -23,7 +25,7 @@ Output:
         "otherJobsProcessing" = 2,
         "otherJobsScheduled" = 1,
         "otherJobsQueue" = 1,
-        "amsAccountName" = "accountname"
+        "amsRESTAPIEndpoint" = "http:/...."
     }
  }
 */
@@ -52,21 +54,23 @@ using Microsoft.WindowsAzure.Storage;
 using Microsoft.WindowsAzure.Storage.Blob;
 using Microsoft.WindowsAzure.Storage.Auth;
 using Microsoft.Azure.WebJobs;
-
+using Microsoft.IdentityModel.Clients.ActiveDirectory;
 
 // Read values from the App.config file.
-private static readonly string _mediaServicesAccountName = Environment.GetEnvironmentVariable("AMSAccount");
-private static readonly string _mediaServicesAccountKey = Environment.GetEnvironmentVariable("AMSKey");
-
 static string _storageAccountName = Environment.GetEnvironmentVariable("MediaServicesStorageAccountName");
 static string _storageAccountKey = Environment.GetEnvironmentVariable("MediaServicesStorageAccountKey");
 
+static readonly string _AADTenantDomain = Environment.GetEnvironmentVariable("AMSAADTenantDomain");
+static readonly string _RESTAPIEndpoint = Environment.GetEnvironmentVariable("AMSRESTAPIEndpoint");
+
+static readonly string _mediaservicesClientId = Environment.GetEnvironmentVariable("AMSClientId");
+static readonly string _mediaservicesClientSecret = Environment.GetEnvironmentVariable("AMSClientSecret");
+
 // Field for service context.
 private static CloudMediaContext _context = null;
-private static MediaServicesCredentials _cachedCredentials = null;
 private static CloudStorageAccount _destinationStorageAccount = null;
 
-public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
+public static async Task<object> Run(HttpRequestMessage req, TraceWriter log, Microsoft.Azure.WebJobs.ExecutionContext execContext)
 {
     log.Info($"Webhook was triggered!");
 
@@ -85,7 +89,7 @@ public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
         });
     }
 
-    log.Info($"Using Azure Media Services account : {_mediaServicesAccountName}");
+    log.Info($"Using Azure Media Service Rest API Endpoint : {_RESTAPIEndpoint}");
 
     IJob job = null;
     string startTime = "";
@@ -103,13 +107,13 @@ public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
 
     try
     {
-        // Create and cache the Media Services credentials in a static class variable.
-        _cachedCredentials = new MediaServicesCredentials(
-                        _mediaServicesAccountName,
-                        _mediaServicesAccountKey);
+        AzureAdTokenCredentials tokenCredentials = new AzureAdTokenCredentials(_AADTenantDomain,
+                              new AzureAdClientSymmetricKey(_mediaservicesClientId, _mediaservicesClientSecret),
+                              AzureEnvironments.AzureCloudEnvironment);
 
-        // Used the chached credentials to create CloudMediaContext.
-        _context = new CloudMediaContext(_cachedCredentials);
+        AzureAdTokenProvider tokenProvider = new AzureAdTokenProvider(tokenCredentials);
+
+        _context = new CloudMediaContext(new Uri(_RESTAPIEndpoint), tokenProvider);
 
         // Get the job
         string jobid = (string)data.jobId;
@@ -125,19 +129,27 @@ public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
             });
         }
 
-        for (int i = 1; i <= 3; i++) // let's wait 3 times 5 seconds (15 seconds)
+        if (data.noWait != null && (bool)data.noWait)
         {
-            log.Info($"Job {job.Id} status is {job.State}");
-
-            if (job.State == JobState.Finished || job.State == JobState.Canceled || job.State == JobState.Error)
-            {
-                break;
-            }
-
-            log.Info("Waiting 5 s...");
-            System.Threading.Thread.Sleep(5 * 1000);
-            job = _context.Jobs.Where(j => j.Id == job.Id).FirstOrDefault();
+            // No wait
         }
+        else
+        {
+            for (int i = 1; i <= 3; i++) // let's wait 3 times 5 seconds (15 seconds)
+            {
+                log.Info($"Job {job.Id} status is {job.State}");
+
+                if (job.State == JobState.Finished || job.State == JobState.Canceled || job.State == JobState.Error)
+                {
+                    break;
+                }
+
+                log.Info("Waiting 5 s...");
+                System.Threading.Thread.Sleep(5 * 1000);
+                job = _context.Jobs.Where(j => j.Id == job.Id).FirstOrDefault();
+            }
+        }
+
 
         if (job.State == JobState.Error || job.State == JobState.Canceled)
         {
@@ -179,7 +191,7 @@ public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
         stats.otherJobsProcessing = _context.Jobs.Where(j => j.State == JobState.Processing).Count();
         stats.otherJobsScheduled = _context.Jobs.Where(j => j.State == JobState.Scheduled).Count();
         stats.otherJobsQueue = _context.Jobs.Where(j => j.State == JobState.Queued).Count();
-        stats.amsAccountName = _mediaServicesAccountName;
+        stats.amsRESTAPIEndpoint = _RESTAPIEndpoint;
 
         return req.CreateResponse(HttpStatusCode.OK, new
         {
@@ -190,7 +202,8 @@ public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
             runningDuration = runningDuration,
             extendedInfo = stats.ToString(),
             isRunning = isRunning.ToString(),
-            isSuccessful = isSuccessful.ToString()
+            isSuccessful = isSuccessful.ToString(),
+            progress = job.GetOverallProgress()
         });
     }
     else
@@ -203,7 +216,8 @@ public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
             endTime = endTime,
             runningDuration = runningDuration,
             isRunning = isRunning.ToString(),
-            isSuccessful = isSuccessful.ToString()
+            isSuccessful = isSuccessful.ToString(),
+            progress = job.GetOverallProgress()
         });
     }
 }
@@ -225,7 +239,6 @@ public static string ReturnMediaReservedUnitName(ReservedUnitType unitType)
 
     }
 }
-
 
 
 

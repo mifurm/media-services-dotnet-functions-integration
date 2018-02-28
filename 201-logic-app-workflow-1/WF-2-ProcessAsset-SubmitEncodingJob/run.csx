@@ -4,6 +4,7 @@
 
 #load "../Shared/mediaServicesHelpers.csx"
 #load "../Shared/ingestAssetConfigHelpers.csx"
+#load "../Shared/jobHelpers.csx"
 
 using System;
 using System.Net;
@@ -11,16 +12,18 @@ using System.Web;
 using Newtonsoft.Json;
 using Microsoft.WindowsAzure.MediaServices.Client;
 using Microsoft.WindowsAzure.Storage;
-
+using Microsoft.IdentityModel.Clients.ActiveDirectory;
 
 // Read values from the App.config file.
-private static readonly string _mediaServicesAccountName = Environment.GetEnvironmentVariable("AMSAccount");
-private static readonly string _mediaServicesAccountKey = Environment.GetEnvironmentVariable("AMSKey");
+static readonly string _AADTenantDomain = Environment.GetEnvironmentVariable("AMSAADTenantDomain");
+static readonly string _RESTAPIEndpoint = Environment.GetEnvironmentVariable("AMSRESTAPIEndpoint");
+
+static readonly string _mediaservicesClientId = Environment.GetEnvironmentVariable("AMSClientId");
+static readonly string _mediaservicesClientSecret = Environment.GetEnvironmentVariable("AMSClientSecret");
 
 // Field for service context.
 private static CloudMediaContext _context = null;
 private static CloudStorageAccount _destinationStorageAccount = null;
-
 
 public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
 {
@@ -45,13 +48,22 @@ public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
     log.Info("Input - Valid IngestAssetConfig was loaded.");
 
 
+    int taskindex = 0;
     IJob job = null;
     IAsset outputAsset = null;
+    IAsset outputEncoding = null;
     try
     {
         // Load AMS account context
-        log.Info("Using Azure Media Services account : " + _mediaServicesAccountName);
-        _context = new CloudMediaContext(new MediaServicesCredentials(_mediaServicesAccountName, _mediaServicesAccountKey));
+        log.Info($"Using Azure Media Service Rest API Endpoint : {_RESTAPIEndpoint}");
+
+        AzureAdTokenCredentials tokenCredentials = new AzureAdTokenCredentials(_AADTenantDomain,
+                                  new AzureAdClientSymmetricKey(_mediaservicesClientId, _mediaservicesClientSecret),
+                                  AzureEnvironments.AzureCloudEnvironment);
+
+        AzureAdTokenProvider tokenProvider = new AzureAdTokenProvider(tokenCredentials);
+
+        _context = new CloudMediaContext(new Uri(_RESTAPIEndpoint), tokenProvider);
 
         // Get the Asset
         var asset = _context.Assets.Where(a => a.Id == assetid).FirstOrDefault();
@@ -81,7 +93,8 @@ public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
                     taskEncoding.InputAssets.Add(asset);
                     // Add an output asset to contain the results of the job.
                     // This output is specified as AssetCreationOptions.None, which means the output asset is not encrypted. 
-                    taskEncoding.OutputAssets.AddNew(asset.Name + " - Media Standard encoded (by Functions Workflow)", AssetCreationOptions.None);
+                    outputEncoding = taskEncoding.OutputAssets.AddNew(asset.Name + " - Media Standard encoded (by Functions Workflow)", AssetCreationOptions.None);
+                    taskindex++;
                 }
                 break;
             case "MEPW":
@@ -104,8 +117,8 @@ public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
                     taskEncoding.InputAssets.Add(asset);
                     // Add an output asset to contain the results of the job.
                     // This output is specified as AssetCreationOptions.None, which means the output asset is not encrypted. 
-                    taskEncoding.OutputAssets.AddNew(asset.Name + " - Media Premium Workflow encoded (by Functions Workflow)", AssetCreationOptions.None);
-
+                    outputEncoding = taskEncoding.OutputAssets.AddNew(asset.Name + " - Media Premium Workflow encoded (by Functions Workflow)", AssetCreationOptions.None);
+                    taskindex++;
                 }
                 break;
             default:
@@ -113,10 +126,20 @@ public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
                 break;
         }
 
+        // Media Analytics
+        //AddTask(job, asset, (string)data.indexV1Language, "Azure Media Indexer", "IndexerV1.xml", "English", ref taskindex);
+        AddTask(job, asset, (string)data.indexV2Language, "Azure Media Indexer 2 Preview", "IndexerV2.json", "EnUs", ref taskindex);
+        AddTask(job, asset, (string)data.ocrLanguage, "Azure Media OCR", "OCR.json", "AutoDetect", ref taskindex);
+        AddTask(job, asset, (string)data.faceDetectionMode, "Azure Media Face Detector", "FaceDetection.json", "PerFaceEmotion", ref taskindex);
+        AddTask(job, asset, (string)data.faceRedactionMode, "Azure Media Redactor", "FaceRedaction.json", "combined", ref taskindex);
+        AddTask(job, asset, (string)data.motionDetectionLevel, "Azure Media Motion Detector", "MotionDetection.json", "medium", ref taskindex);
+        AddTask(job, asset, (string)data.summarizationDuration, "Azure Media Video Thumbnails", "Summarization.json", "0.0", ref taskindex);
+
         job.Submit();
         log.Info("Job Submitted");
 
         outputAsset = job.OutputMediaAssets.FirstOrDefault();
+        //outputAsset = outputEncoding;
     }
     catch (Exception ex)
     {

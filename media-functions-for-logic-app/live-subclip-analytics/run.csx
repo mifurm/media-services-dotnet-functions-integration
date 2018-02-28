@@ -7,6 +7,66 @@ Input:
     "channelName": "channel1",      // Mandatory
     "programName" : "program1",     // Mandatory
     "intervalSec" : 60              // Optional. Default is 60 seconds. The duration of subclip (and interval between two calls)
+
+    "mesSubclip" :      // Optional as subclip will always be done but it is required to specify an output storage
+    {
+        "outputStorage" : "amsstorage01" // Optional. Storage account name where to put the output asset (attached to AMS account)
+    },
+    "mesThumbnails" :      // Optional but required to generate thumbnails with Media Encoder Standard (MES)
+    {
+        "start" : "{Best}",  // Optional. Start time/mode. Default is "{Best}"
+        "outputStorage" : "amsstorage01" // Optional. Storage account name where to put the output asset (attached to AMS account)
+    },
+     "indexV1" :             // Optional but required to index audio with Media Indexer v1
+    {
+        "language" : "English", // Optional. Default is "English"
+        "outputStorage" : "amsstorage01" // Optional. Storage account name where to put the output asset (attached to AMS account)
+    },
+    "indexV2" :             // Optional but required to index audio with Media Indexer v2
+    {
+        "language" : "EnUs", // Optional. Default is EnUs
+        "outputStorage" : "amsstorage01" // Optional. Storage account name where to put the output asset (attached to AMS account)
+    },
+    "ocr" :             // Optional but required to do OCR
+    {
+        "language" : "AutoDetect", // Optional (Autodetect is the default)
+        "outputStorage" : "amsstorage01" // Optional. Storage account name where to put the output asset (attached to AMS account)
+    },
+    "faceDetection" :             // Optional but required to do Face Detection
+    {
+        "mode" : "PerFaceEmotion", // Optional (PerFaceEmotion is the default)
+        "outputStorage" : "amsstorage01" // Optional. Storage account name where to put the output asset (attached to AMS account)
+    },
+    "faceRedaction" :             // Optional but required to do Face Redaction
+    {
+        "mode" : "analyze"                  // Optional (analyze is the default)
+        "outputStorage" : "amsstorage01"    // Optional. Storage account name where to put the output asset (attached to AMS account)
+    },
+    "motionDetection" :             // Optional but required to do Motion Detection
+    {
+        "level" : "medium",                 // Optional (medium is the default)
+        "outputStorage" : "amsstorage01"    // Optional. Storage account name where to put the output asset (attached to AMS account)
+    },
+    "summarization" :                      // Optional but required to do Motion Detection
+    {
+        "duration" : "0.0",                 // Optional (0.0 is the default)
+        "outputStorage" : "amsstorage01"    // Optional. Storage account name where to put the output asset (attached to AMS account)
+    },
+    "hyperlapse" :             // Optional but required to do Motion Detection
+    {
+        "speed" : "8", // Optional (8 is the default)
+        "outputStorage" : "amsstorage01"    // Optional. Storage account name where to put the output asset (attached to AMS account)
+    },
+    "videoAnnotation" :             // Optional but required to do Video Annotator
+    {
+        "outputStorage" : "amsstorage01"    // Optional. Storage account name where to put the output asset (attached to AMS account)
+    },
+
+
+    // General job properties
+    "priority" : 10,                            // Optional, priority of the job
+ 
+    // For compatibility only with old workflows. Do not use anymore!
     "indexV1Language" : "English",  // Optional
     "indexV2Language" : "EnUs",     // Optional
     "ocrLanguage" : "AutoDetect" or "English",  // Optional
@@ -15,7 +75,7 @@ Input:
     "motionDetectionLevel" : "medium",          // Optional
     "summarizationDuration" : "0.0",            // Optional. 0.0 for automatic
     "hyperlapseSpeed" : "8"                     // Optional
-    "priority" : 10                             // Optional. Priority of the job
+    "mesThumbnailsStart" : "{Best}",            // Optional. Add a task to generate thumbnails
 }
 
 Output:
@@ -71,6 +131,16 @@ Output:
             assetId : "",
             taskId : ""
         },
+         "mesThumbnails" :
+        {
+            assetId : "",
+            taskId : ""
+        },
+         "videoAnnotation" :
+        {
+            assetId : "",
+            taskId : ""
+        }
         "programId" = programid,
         "channelName" : "",
         "programName" : "",
@@ -111,21 +181,23 @@ using Microsoft.WindowsAzure.Storage.Auth;
 using Microsoft.Azure.WebJobs;
 using System.Xml;
 using System.Xml.Linq;
+using Microsoft.IdentityModel.Clients.ActiveDirectory;
 
 // Read values from the App.config file.
-private static readonly string _mediaServicesAccountName = Environment.GetEnvironmentVariable("AMSAccount");
-private static readonly string _mediaServicesAccountKey = Environment.GetEnvironmentVariable("AMSKey");
-
 static string _storageAccountName = Environment.GetEnvironmentVariable("MediaServicesStorageAccountName");
 static string _storageAccountKey = Environment.GetEnvironmentVariable("MediaServicesStorageAccountKey");
 
+static readonly string _AADTenantDomain = Environment.GetEnvironmentVariable("AMSAADTenantDomain");
+static readonly string _RESTAPIEndpoint = Environment.GetEnvironmentVariable("AMSRESTAPIEndpoint");
+
+static readonly string _mediaservicesClientId = Environment.GetEnvironmentVariable("AMSClientId");
+static readonly string _mediaservicesClientSecret = Environment.GetEnvironmentVariable("AMSClientSecret");
+
 // Field for service context.
 private static CloudMediaContext _context = null;
-private static MediaServicesCredentials _cachedCredentials = null;
 private static CloudStorageAccount _destinationStorageAccount = null;
 
-
-public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
+public static async Task<object> Run(HttpRequestMessage req, TraceWriter log, Microsoft.Azure.WebJobs.ExecutionContext execContext)
 {
     // Variables
     int taskindex = 0;
@@ -139,6 +211,9 @@ public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
     int OutputMotion = -1;
     int OutputSummarization = -1;
     int OutputHyperlapse = -1;
+    int OutputMesThumbnails = -1;
+    int OutputVideoAnnotation = -1;
+
     int id = 0;
     string programid = "";
     string programName = "";
@@ -150,7 +225,6 @@ public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
     IJob job = null;
     ITask taskEncoding = null;
     int NumberJobsQueue = 0;
-
 
     int intervalsec = 60; // Interval for each subclip job (sec). Default is 60
 
@@ -178,17 +252,17 @@ public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
         intervalsec = (int)data.intervalSec;
     }
 
-    log.Info($"Using Azure Media Services account : {_mediaServicesAccountName}");
+    log.Info($"Using Azure Media Service Rest API Endpoint : {_RESTAPIEndpoint}");
 
     try
     {
-        // Create and cache the Media Services credentials in a static class variable.
-        _cachedCredentials = new MediaServicesCredentials(
-                        _mediaServicesAccountName,
-                        _mediaServicesAccountKey);
+        AzureAdTokenCredentials tokenCredentials = new AzureAdTokenCredentials(_AADTenantDomain,
+                            new AzureAdClientSymmetricKey(_mediaservicesClientId, _mediaservicesClientSecret),
+                            AzureEnvironments.AzureCloudEnvironment);
 
-        // Used the chached credentials to create CloudMediaContext.
-        _context = new CloudMediaContext(_cachedCredentials);
+        AzureAdTokenProvider tokenProvider = new AzureAdTokenProvider(tokenCredentials);
+
+        _context = new CloudMediaContext(new Uri(_RESTAPIEndpoint), tokenProvider);
 
         // find the Channel, Program and Asset
         channelName = (string)data.channelName;
@@ -279,7 +353,8 @@ public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
                 var delta = (livetime - lastendtimeInTableValue - TimeSpan.FromSeconds(intervalsec)).Duration();
                 log.Info($"Delta: {delta}");
 
-                if (delta < (new TimeSpan(0, 10, 0))) // less than 10 min
+                //if (delta < (new TimeSpan(0, 0, 3*intervalsec))) // less than 3 times the normal duration (3*60s)
+                if (delta < (TimeSpan.FromSeconds(3 * intervalsec))) // less than 3 times the normal duration (3*60s)
                 {
                     starttime = lastendtimeInTableValue;
                     log.Info($"Value new starttime : {starttime}");
@@ -290,8 +365,8 @@ public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
         duration = livetime - starttime;
         log.Info($"Value duration: {duration}");
 
-        string ConfigurationSubclip = File.ReadAllText(@"D:\home\site\wwwroot\Presets\LiveSubclip.json").Replace("0:00:00.000000", starttime.Subtract(TimeSpan.FromMilliseconds(100)).ToString()).Replace("0:00:30.000000", duration.Add(TimeSpan.FromMilliseconds(200)).ToString());
-
+        // D:\home\site\wwwroot\Presets\LiveSubclip.json
+        string ConfigurationSubclip = File.ReadAllText(Path.Combine(System.IO.Directory.GetParent(execContext.FunctionDirectory).FullName, "presets", "LiveSubclip.json")).Replace("0:00:00.000000", starttime.Subtract(TimeSpan.FromMilliseconds(100)).ToString()).Replace("0:00:30.000000", duration.Add(TimeSpan.FromMilliseconds(200)).ToString());
 
         int priority = 10;
         if (data.priority != null)
@@ -323,19 +398,38 @@ public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
         // Add an output asset to contain the results of the job. 
         // This output is specified as AssetCreationOptions.None, which 
         // means the output asset is not encrypted. 
-        var subclipasset = taskEncoding.OutputAssets.AddNew(asset.Name + " subclipped " + triggerStart, AssetCreationOptions.None);
+        var subclipasset = taskEncoding.OutputAssets.AddNew(asset.Name + " subclipped " + triggerStart, OutputStorageFromParam(data.mesSubclip), AssetCreationOptions.None);
 
         log.Info($"Adding media analytics tasks");
 
-        // Media Analytics
-        OutputIndex1 = AddTask(job, subclipasset, (string)data.indexV1Language, "Azure Media Indexer", "IndexerV1.xml", "English", ref taskindex);
-        OutputIndex2 = AddTask(job, subclipasset, (string)data.indexV2Language, "Azure Media Indexer 2 Preview", "IndexerV2.json", "EnUs", ref taskindex);
-        OutputOCR = AddTask(job, subclipasset, (string)data.ocrLanguage, "Azure Media OCR", "OCR.json", "AutoDetect", ref taskindex);
-        OutputFaceDetection = AddTask(job, subclipasset, (string)data.faceDetectionMode, "Azure Media Face Detector", "FaceDetection.json", "PerFaceEmotion", ref taskindex);
-        OutputFaceRedaction = AddTask(job, subclipasset, (string)data.faceRedactionMode, "Azure Media Redactor", "FaceRedaction.json", "combined", ref taskindex, priority - 1);
-        OutputMotion = AddTask(job, subclipasset, (string)data.motionDetectionLevel, "Azure Media Motion Detector", "MotionDetection.json", "medium", ref taskindex, priority - 1);
-        OutputSummarization = AddTask(job, subclipasset, (string)data.summarizationDuration, "Azure Media Video Thumbnails", "Summarization.json", "0.0", ref taskindex);
-        OutputHyperlapse = AddTask(job, subclipasset, (string)data.hyperlapseSpeed, "Azure Media Hyperlapse", "Hyperlapse.json", "8", ref taskindex);
+        /*
+                // Media Analytics
+                OutputIndex1 = AddTask(job, subclipasset, (string)data.indexV1Language, "Azure Media Indexer", "IndexerV1.xml", "English", ref taskindex);
+                OutputIndex2 = AddTask(job, subclipasset, (string)data.indexV2Language, "Azure Media Indexer 2 Preview", "IndexerV2.json", "EnUs", ref taskindex);
+                OutputOCR = AddTask(job, subclipasset, (string)data.ocrLanguage, "Azure Media OCR", "OCR.json", "AutoDetect", ref taskindex);
+                OutputFaceDetection = AddTask(job, subclipasset, (string)data.faceDetectionMode, "Azure Media Face Detector", "FaceDetection.json", "PerFaceEmotion", ref taskindex);
+                OutputFaceRedaction = AddTask(job, subclipasset, (string)data.faceRedactionMode, "Azure Media Redactor", "FaceRedaction.json", "combined", ref taskindex, priority - 1);
+                OutputMotion = AddTask(job, subclipasset, (string)data.motionDetectionLevel, "Azure Media Motion Detector", "MotionDetection.json", "medium", ref taskindex, priority - 1);
+                OutputSummarization = AddTask(job, subclipasset, (string)data.summarizationDuration, "Azure Media Video Thumbnails", "Summarization.json", "0.0", ref taskindex);
+                OutputHyperlapse = AddTask(job, subclipasset, (string)data.hyperlapseSpeed, "Azure Media Hyperlapse", "Hyperlapse.json", "8", ref taskindex);
+                OutputMesThumbnails = AddTask(job, subclipasset, (string)data.mesThumbnailsStart, "Media Encoder Standard", "MesThumbnails.json", "{Best}", ref taskindex);
+        */
+
+        //new
+        OutputIndex1 = AddTask(execContext, job, subclipasset, (data.indexV1 == null) ? (string)data.indexV1Language : ((string)data.indexV1.language ?? "English"), "Azure Media Indexer", "IndexerV1.xml", "English", ref taskindex, specifiedStorageAccountName: OutputStorageFromParam(data.indexV1));
+        OutputIndex2 = AddTask(execContext, job, subclipasset, (data.indexV2 == null) ? (string)data.indexV2Language : ((string)data.indexV2.language ?? "EnUs"), "Azure Media Indexer 2 Preview", "IndexerV2.json", "EnUs", ref taskindex, specifiedStorageAccountName: OutputStorageFromParam(data.indexV2));
+        OutputOCR = AddTask(execContext, job, subclipasset, (data.ocr == null) ? (string)data.ocrLanguage : ((string)data.ocr.language ?? "AutoDetect"), "Azure Media OCR", "OCR.json", "AutoDetect", ref taskindex, specifiedStorageAccountName: OutputStorageFromParam(data.ocr));
+        OutputFaceDetection = AddTask(execContext, job, subclipasset, (data.faceDetection == null) ? (string)data.faceDetectionMode : ((string)data.faceDetection.mode ?? "PerFaceEmotion"), "Azure Media Face Detector", "FaceDetection.json", "PerFaceEmotion", ref taskindex, specifiedStorageAccountName: OutputStorageFromParam(data.faceDetection));
+        OutputFaceRedaction = AddTask(execContext, job, subclipasset, (data.faceRedaction == null) ? (string)data.faceRedactionMode : ((string)data.faceRedaction.mode ?? "comined"), "Azure Media Redactor", "FaceRedaction.json", "combined", ref taskindex, priority - 1, specifiedStorageAccountName: OutputStorageFromParam(data.faceRedaction));
+        OutputMotion = AddTask(execContext, job, subclipasset, (data.motionDetection == null) ? (string)data.motionDetectionLevel : ((string)data.motionDetection.level ?? "medium"), "Azure Media Motion Detector", "MotionDetection.json", "medium", ref taskindex, priority - 1, specifiedStorageAccountName: OutputStorageFromParam(data.motionDetection));
+        OutputSummarization = AddTask(execContext, job, subclipasset, (data.summarization == null) ? (string)data.summarizationDuration : ((string)data.summarization.duration ?? "0.0"), "Azure Media Video Thumbnails", "Summarization.json", "0.0", ref taskindex, specifiedStorageAccountName: OutputStorageFromParam(data.summarization));
+        OutputVideoAnnotation = AddTask(execContext, job, subclipasset, (data.videoAnnotation != null) ? "1.0" : null, "Azure Media Video Annotator", "VideoAnnotation.json", "1.0", ref taskindex, specifiedStorageAccountName: OutputStorageFromParam(data.videoAnnotation));
+
+        // MES Thumbnails
+        OutputMesThumbnails = AddTask(execContext, job, subclipasset, (data.mesThumbnails != null) ? ((string)data.mesThumbnails.Start ?? "{Best}") : null, "Media Encoder Standard", "MesThumbnails.json", "{Best}", ref taskindex, specifiedStorageAccountName: OutputStorageFromParam(data.mesThumbnails));
+
+        // Hyperlapse
+        OutputHyperlapse = AddTask(execContext, job, subclipasset, (data.hyperlapse == null) ? (string)data.hyperlapseSpeed : ((string)data.hyperlapse.speed ?? "8"), "Azure Media Hyperlapse", "Hyperlapse.json", "8", ref taskindex, specifiedStorageAccountName: OutputStorageFromParam(data.hyperlapse));
 
         job.Submit();
         log.Info("Job Submitted");
@@ -406,6 +500,11 @@ public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
             start = starttime,
             duration = duration,
         },
+        mesThumbnails = new
+        {
+            assetId = ReturnId(job, OutputMesThumbnails),
+            taskId = ReturnTaskId(job, OutputMesThumbnails)
+        },
         indexV1 = new
         {
             assetId = ReturnId(job, OutputIndex1),
@@ -448,6 +547,12 @@ public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
             assetId = ReturnId(job, OutputHyperlapse),
             taskId = ReturnTaskId(job, OutputHyperlapse)
         },
+        videoAnnotation = new
+        {
+            assetId = ReturnId(job, OutputVideoAnnotation),
+            taskId = ReturnTaskId(job, OutputVideoAnnotation)
+        },
+
         channelName = channelName,
         programName = programName,
         programId = programid,
@@ -549,7 +654,7 @@ static public ManifestTimingData GetManifestTimingData(IAsset asset, TraceWriter
                 timescalefrommanifest = videotrack.FirstOrDefault().Attribute("TimeScale").Value;
             }
             ulong timescale = ulong.Parse(timescalefrommanifest);
-            response.TimeScale = (timescale == TimeSpan.TicksPerSecond) ? null : (ulong?)timescale; // if 10000000 then null (default)
+            response.TimeScale = (ulong?)timescale;
 
             // Timestamp offset
             if (videotrack.FirstOrDefault().Element("c").Attribute("t") != null)

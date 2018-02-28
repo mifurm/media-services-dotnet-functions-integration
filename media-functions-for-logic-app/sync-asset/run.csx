@@ -1,10 +1,13 @@
 /*
-This function create the asset files based on the blobs in the asset container.
+This function declares the asset files in the AMS asset based on the blobs in the asset container.
 
 Input:
 {
     "assetId" : "the Id of the asset"
 }
+
+Output:
+{}
 
 */
 
@@ -13,6 +16,8 @@ Input:
 #r "System.Web"
 #load "../Shared/mediaServicesHelpers.csx"
 #load "../Shared/copyBlobHelpers.csx"
+#load "../Shared/keyHelpers.csx"
+
 
 using System;
 using System.Net;
@@ -31,21 +36,26 @@ using Microsoft.WindowsAzure.Storage;
 using Microsoft.WindowsAzure.Storage.Blob;
 using Microsoft.WindowsAzure.Storage.Auth;
 using Microsoft.Azure.WebJobs;
-
+using Microsoft.IdentityModel.Clients.ActiveDirectory;
 
 // Read values from the App.config file.
-private static readonly string _mediaServicesAccountName = Environment.GetEnvironmentVariable("AMSAccount");
-private static readonly string _mediaServicesAccountKey = Environment.GetEnvironmentVariable("AMSKey");
-
 static string _storageAccountName = Environment.GetEnvironmentVariable("MediaServicesStorageAccountName");
 static string _storageAccountKey = Environment.GetEnvironmentVariable("MediaServicesStorageAccountKey");
 
+static readonly string _AADTenantDomain = Environment.GetEnvironmentVariable("AMSAADTenantDomain");
+static readonly string _RESTAPIEndpoint = Environment.GetEnvironmentVariable("AMSRESTAPIEndpoint");
+
+static readonly string _mediaservicesClientId = Environment.GetEnvironmentVariable("AMSClientId");
+static readonly string _mediaservicesClientSecret = Environment.GetEnvironmentVariable("AMSClientSecret");
+
+static readonly string _attachedStorageCredentials = Environment.GetEnvironmentVariable("MediaServicesAttachedStorageCredentials");
+
 // Field for service context.
 private static CloudMediaContext _context = null;
-private static MediaServicesCredentials _cachedCredentials = null;
 private static CloudStorageAccount _destinationStorageAccount = null;
 
-public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
+
+public static async Task<object> Run(HttpRequestMessage req, TraceWriter log, Microsoft.Azure.WebJobs.ExecutionContext execContext)
 {
     log.Info($"Webhook was triggered!");
 
@@ -53,6 +63,9 @@ public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
     dynamic data = JsonConvert.DeserializeObject(jsonContent);
 
     log.Info(jsonContent);
+
+    log.Info(_attachedStorageCredentials);
+    var attachedstoragecred = ReturnStorageCredentials();
 
     if (data.assetId == null)
     {
@@ -65,18 +78,18 @@ public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
         });
     }
 
-
-    log.Info($"Using Azure Media Services account : {_mediaServicesAccountName}");
+    log.Info($"Using Azure Media Service Rest API Endpoint : {_RESTAPIEndpoint}");
 
     try
     {
-        // Create and cache the Media Services credentials in a static class variable.
-        _cachedCredentials = new MediaServicesCredentials(
-                        _mediaServicesAccountName,
-                        _mediaServicesAccountKey);
+        AzureAdTokenCredentials tokenCredentials = new AzureAdTokenCredentials(_AADTenantDomain,
+                          new AzureAdClientSymmetricKey(_mediaservicesClientId, _mediaservicesClientSecret),
+                          AzureEnvironments.AzureCloudEnvironment);
 
-        // Used the chached credentials to create CloudMediaContext.
-        _context = new CloudMediaContext(_cachedCredentials);
+        AzureAdTokenProvider tokenProvider = new AzureAdTokenProvider(tokenCredentials);
+
+        _context = new CloudMediaContext(new Uri(_RESTAPIEndpoint), tokenProvider);
+
 
         // Step 1:  Copy the Blob into a new Input Asset for the Job
         // ***NOTE: Ideally we would have a method to ingest a Blob directly here somehow. 
@@ -98,6 +111,29 @@ public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
 
         log.Info("Asset found, ID: " + asset.Id);
 
+
+        string storname = _storageAccountName;
+        string storkey = _storageAccountKey;
+        if (asset.StorageAccountName != _storageAccountName)
+        {
+            if (attachedstoragecred.ContainsKey(asset.StorageAccountName)) // asset is using another storage than default but we have the key
+            {
+                storname = asset.StorageAccountName;
+                storkey = attachedstoragecred[storname];
+            }
+            else // we don't have the key for that storage
+            {
+                log.Info($"Face redaction Asset is in {asset.StorageAccountName} and key is not provided in MediaServicesAttachedStorageCredentials application settings");
+                return req.CreateResponse(HttpStatusCode.BadRequest, new
+                {
+                    error = "Storage key is missing"
+                });
+            }
+        }
+        
+        CloudBlobContainer assetContainer = GetCloudBlobContainer(storname, storkey, asset.Uri.Segments[1]);
+
+        /*
         //Get a reference to the storage account that is associated with the Media Services account. 
         StorageCredentials mediaServicesStorageCredentials =
             new StorageCredentials(_storageAccountName, _storageAccountKey);
@@ -110,6 +146,8 @@ public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
         log.Info($"destinationContainerName : {destinationContainerName}");
 
         CloudBlobContainer assetContainer = destBlobStorage.GetContainerReference(destinationContainerName);
+        */
+
         log.Info($"assetContainer retrieved");
 
         // Get hold of the destination blobs
@@ -151,7 +189,6 @@ public static async Task<object> Run(HttpRequestMessage req, TraceWriter log)
             Error = ex.ToString()
         });
     }
-
 
     return req.CreateResponse(HttpStatusCode.OK);
 }
